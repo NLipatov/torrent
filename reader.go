@@ -310,45 +310,49 @@ func (r *reader) readOnceAt(ctx context.Context, b []byte, pos int64) (n int, er
 // Performs at most one successful read to torrent storage. Try reading, first with the storage
 // reader we already have, then after resetting it (in case data moved for
 // completed/incomplete/promoted etc.). Then try resetting the piece completions. Then after all
-// that if the storage is supposed to be flaky, try all over again. TODO: Filter errors and set log
-// levels appropriately.
+// that, retry capped storage a bounded number of times. TODO: Filter errors and set log levels
+// appropriately.
+const maxCappedStorageReadAttempts = 16
+
 func (r *reader) readAt(ctx context.Context, b []byte, pos int64) (n int, err error) {
 	if pos >= r.length {
 		err = io.EOF
 		return
 	}
-	n, err = r.readOnceAt(ctx, b, pos)
-	if err == nil {
-		return
-	}
-	r.slogger().Error("initial read failed", "err", err)
+	for attempt := 1; ; attempt++ {
+		if err = ctx.Err(); err != nil {
+			return
+		}
+		n, err = r.readOnceAt(ctx, b, pos)
+		if err == nil {
+			return
+		}
+		r.slogger().Error("initial read failed", "err", err)
 
-	err = r.clearStorageReader()
-	if err != nil {
-		err = fmt.Errorf("closing storage reader after first read failed: %w", err)
-		return
-	}
-	r.storageReader = nil
+		err = r.clearStorageReader()
+		if err != nil {
+			err = fmt.Errorf("closing storage reader after first read failed: %w", err)
+			return
+		}
+		r.storageReader = nil
 
-	n, err = r.readOnceAt(ctx, b, pos)
-	if err == nil {
-		return
-	}
-	r.slogger().Error("read failed after reader reset", "err", err)
+		n, err = r.readOnceAt(ctx, b, pos)
+		if err == nil {
+			return
+		}
+		r.slogger().Error("read failed after reader reset", "err", err)
 
-	r.updatePieceCompletion(pos)
+		r.updatePieceCompletion(pos)
 
-	n, err = r.readOnceAt(ctx, b, pos)
-	if err == nil {
-		return
-	}
-	r.slogger().Error("read failed after completion resync", "err", err)
+		n, err = r.readOnceAt(ctx, b, pos)
+		if err == nil {
+			return
+		}
+		r.slogger().Error("read failed after completion resync", "err", err)
 
-	if r.t.hasStorageCap() {
-		// Ensure params weren't modified (Go sux). Recurse to detect infinite loops. TODO: I expect
-		// only some errors should pass through here, this might cause us to get stuck if we retry
-		// for any error.
-		return r.readAt(ctx, b, pos)
+		if !r.t.hasStorageCap() || attempt == maxCappedStorageReadAttempts {
+			break
+		}
 	}
 
 	// There should have been something available, avail != 0 here.
