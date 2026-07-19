@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/anacrolix/log"
 	"github.com/anacrolix/missinggo/v2"
@@ -304,16 +305,18 @@ func (r *reader) readOnceAt(ctx context.Context, b []byte, pos int64) (n int, er
 // Performs at most one successful read to torrent storage. Try reading, first with the storage
 // reader we already have, then after resetting it (in case data moved for
 // completed/incomplete/promoted etc.). Then try resetting the piece completions. Then after all
-// that, retry capped storage a bounded number of times. TODO: Filter errors and set log levels
-// appropriately.
-const maxCappedStorageReadAttempts = 16
+// that, wait and try capped storage again until the read context ends. The
+// delay prevents a permanently broken storage implementation from busy
+// spinning while preserving the capped-storage contract that evicted data can
+// become available again.
+const cappedStorageReadRetryDelay = 25 * time.Millisecond
 
 func (r *reader) readAt(ctx context.Context, b []byte, pos int64) (n int, err error) {
 	if pos >= r.length {
 		err = io.EOF
 		return
 	}
-	for attempt := 1; ; attempt++ {
+	for {
 		if err = ctx.Err(); err != nil {
 			return
 		}
@@ -344,8 +347,18 @@ func (r *reader) readAt(ctx context.Context, b []byte, pos int64) (n int, err er
 		}
 		r.slogger().Error("read failed after completion resync", "err", err)
 
-		if !r.t.hasStorageCap() || attempt == maxCappedStorageReadAttempts {
+		if !r.t.hasStorageCap() || r.t.closed.IsSet() {
 			break
+		}
+		timer := time.NewTimer(cappedStorageReadRetryDelay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			err = ctx.Err()
+			return
+		case <-timer.C:
 		}
 	}
 

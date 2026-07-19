@@ -78,6 +78,9 @@ func TestCappedStorageReadFailuresReturn(t *testing.T) {
 	defer r.Close()
 	_, err = r.Seek(50, io.SeekStart)
 	require.NoError(t, err)
+	ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	r.SetContext(ctx)
 	_, err = r.Read(make([]byte, 1))
-	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
